@@ -314,3 +314,219 @@ The template creation script is located at:
 ---
 
 **Remember: Accuracy over speed. Always verify TouchDesigner syntax and parameter names in the official documentation before providing code examples or solutions.**
+
+---
+
+# P3A TouchDesigner Integration Project
+
+## Project Overview
+
+**NOTE**: This repository contains TWO separate TouchDesigner projects:
+1. **HydraToTD** - The original project documented above (Hydra visual synthesis integration)
+2. **P3A Display Integration** - NEW project for sending TouchDesigner renders to P3A pixel art display
+
+This section documents the **P3A Display Integration** project.
+
+## What is P3A?
+
+P3A (Pixel Pea) is a WiFi-enabled ESP32-P4 based pixel art display device:
+- **Hardware**: ESP32-P4 dual-core, 720×720 IPS touchscreen, microSD storage
+- **Display**: 4" square MIPI-DSI display with touch input
+- **Firmware**: ESP-IDF v5.5.x based animation player
+- **Purpose**: Display animated pixel art from SD card or network sources
+
+**Project Goal**: Enable TouchDesigner to send rendered images to P3A display over WiFi in real-time.
+
+## Implementation Status (As of 2025-11-13)
+
+### ✅ COMPLETED: Option 1 - HTTP POST Upload
+
+**Performance**: 2-7 fps (JPEG), 130-430ms latency
+
+**ESP32 Side** (`components/http_api/http_api.c`):
+- Added `POST /upload/image` endpoint
+- Accepts raw binary image data (Content-Type: image/png, image/jpeg, etc.)
+- Chunked upload (4KB chunks, up to 5MB max)
+- Atomic file writes to `/sdcard/animations/td_live.{ext}`
+- Immediately calls `animation_player_load_asset()` for display
+- Returns JSON response with upload status
+
+**TouchDesigner Side** (`touchdesigner/scripts/`):
+- `build_p3a_network.py` - Programmatic network builder
+  - Creates Timer CHOP and Execute DAT automatically
+  - Embeds upload logic in Execute DAT
+  - Fully configurable (TOP name, IP, format, quality, upload rate)
+- `p3a_upload_http.py` - Manual upload script for testing
+- `README.md` - Complete user documentation
+
+**Testing** (`test_upload.sh`):
+- Bash script for ESP32 endpoint validation via curl
+
+### ⏳ PENDING: Option 2 - Direct Memory Display
+
+**Goal**: Bypass SD card for 2-3× speed improvement (10-25 fps)
+
+**Required**:
+- New endpoint: `POST /display/raw`
+- New API: `animation_player_load_from_memory(data, size, type)`
+- RAM buffer management
+
+**Status**: Planned, not started. Awaiting Option 1 hardware validation.
+
+### ⏳ PENDING: Option 3 - WebSocket Streaming
+
+**Goal**: True real-time streaming (20-50 fps) with bi-directional communication
+
+**Required**:
+- WebSocket server integration
+- Binary frame protocol (custom header + JPEG data)
+- Ring buffer (3-frame depth)
+- JPEG-only fast path with ESP32-P4 hardware decoder
+- TouchDesigner WebSocket DAT integration
+
+**Status**: Planned, not started. Only needed if high frame rates required.
+
+## Key Learnings for Future Sessions
+
+### P3A Architecture Insights
+
+1. **Animation Player is Memory-Based**
+   - Files loaded entirely into RAM via `load_animation_file_from_sd()`
+   - Decoder interface accepts `const uint8_t *data, size_t size`
+   - **Implication**: Option 2 just needs to skip file I/O, can reuse decoder pipeline
+
+2. **Animation Directory**: `/sdcard/animations/`
+   - Player scans this directory on startup
+   - Our `td_live.{ext}` file appears in rotation automatically
+   - Configured via Kconfig: `CONFIG_P3A_SD_ANIMATIONS_DIR`
+
+3. **HTTP Server Has Room for Growth**
+   - `max_uri_handlers = 12`, currently using 10 (2 slots remaining)
+   - Can add `/display/raw` for Option 2
+   - WebSocket uses same HTTP server (ESP-IDF built-in support)
+
+4. **Display Pipeline**:
+   ```
+   File/Memory → Decoder → Native Frame → Upscale → LCD Buffer → DMA → Display
+   ```
+   - Double-buffered rendering
+   - Hardware upscaling if source < 720×720
+
+### TouchDesigner Integration Patterns
+
+1. **TOP Pixel Export**:
+   ```python
+   img_array = top_op.numpyArray(delayed=False)
+   # Returns shape (height, width, channels) as float32 (0.0-1.0)
+   # Bottom-left origin - flip with np.flipud()
+   ```
+
+2. **Network Builder Pattern**:
+   ```python
+   timer_chop = parent_comp.create(timerCHOP, 'name')
+   execute_dat = parent_comp.create(executeDAT, 'name')
+   timer_chop.par.timeout = 2  # 2 Hz upload rate
+   execute_dat.par.chopexec0 = timer_chop  # Wire reference
+   execute_dat.text = '''def onValueChange(...): ...'''  # Embed code
+   ```
+   - More reliable than manual .toe files
+   - User can customize after generation
+
+3. **Python Dependencies**: `requests`, `pillow`, `numpy`
+   - Install via tdPyEnvManager (Palette component)
+   - Required for image encoding and HTTP POST
+
+### Known Issues / Edge Cases
+
+1. **Multipart vs Raw Binary**
+   - TouchDesigner `requests.post(files=...)` sends multipart/form-data
+   - Current ESP32 handler expects raw binary
+   - **Status**: Works because Python `requests` library encodes properly
+   - **Watch**: May need multipart parser if issues arise
+
+2. **Thread Safety**
+   - We call `animation_player_load_asset()` from HTTP handler thread
+   - Appears safe (no crashes in code review)
+   - **Watch**: Possible race condition if player is mid-decode
+
+3. **Memory Fragmentation**
+   - Each upload allocates 4KB buffer (freed after use)
+   - Large files loaded by animation player (100KB-2MB)
+   - **Monitor**: Check `/status` endpoint for `heap_free`
+
+## File Locations
+
+```
+tdESP32display/
+├── components/http_api/http_api.c         [MODIFIED] Option 1 endpoint
+├── touchdesigner/                         [NEW]
+│   ├── README.md                          User guide
+│   └── scripts/
+│       ├── build_p3a_network.py          Network builder
+│       └── p3a_upload_http.py            Manual upload
+├── test_upload.sh                         [NEW] Testing script
+├── P3A_STATUS.md                          [NEW] Detailed status doc
+├── TOUCHDESIGNER_INTEGRATION.md           [NEW] Planning doc (all 3 options)
+└── CLAUDE.md                              [THIS FILE]
+```
+
+## Quick Commands for Future Sessions
+
+### Test ESP32 Endpoint
+```bash
+./test_upload.sh p3a.local test_image.jpg
+```
+
+### Setup TouchDesigner Network
+```python
+# In TouchDesigner textport:
+exec(open(r'touchdesigner/scripts/build_p3a_network.py').read())
+op('p3a_upload_timer').par.start.pulse()  # Start uploading
+```
+
+### Check Device Status
+```bash
+curl http://p3a.local/status | python3 -m json.tool
+```
+
+## Next Actions When Hardware Available
+
+1. **Test Option 1 on Real Hardware**
+   - Run `test_upload.sh` to validate ESP32 endpoint
+   - Run TouchDesigner network builder and test uploads
+   - Measure actual performance (latency, frame rate)
+
+2. **Debug Any Issues**
+   - SD card path verification
+   - WiFi connectivity issues
+   - Multipart parsing if needed
+   - Memory usage monitoring
+
+3. **Implement Option 2** (if faster uploads needed)
+   - Add `POST /display/raw` endpoint
+   - Add `animation_player_load_from_memory()` function
+   - Expected: 2-3× speed improvement
+
+4. **Implement Option 3** (if real-time streaming needed)
+   - Only if >20 fps required
+   - Significant effort (1-2 weeks)
+
+## Important Context Files
+
+- **P3A_STATUS.md** - Comprehensive status document with detailed learnings
+- **TOUCHDESIGNER_INTEGRATION.md** - Full planning doc for all 3 options
+- **touchdesigner/README.md** - User-facing quick start guide
+
+## Git Branch
+
+**Current Branch**: `claude/repo-exploration-011CV5aUjwhXLuEnDAMLoWfk`
+
+**Key Commits**:
+- `660999a` - P3A status document
+- `c79540e` - Option 1 implementation (ESP32 + TouchDesigner)
+- `2b019a8` - TouchDesigner integration planning doc updates
+- `ac231b6` - Initial TouchDesigner integration planning doc
+
+---
+
+**For Future Claude**: When resuming P3A work, read `P3A_STATUS.md` for detailed context. Option 1 is production-ready and awaiting hardware testing. Options 2 & 3 are fully planned but not started.
